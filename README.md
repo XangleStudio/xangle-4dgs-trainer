@@ -1,6 +1,6 @@
 # Xangle 4DGS Trainer
 
-Train a 4D Gaussian splat from synchronized, calibrated images on Windows with an NVIDIA CUDA GPU. The command runs without Camera Server or Orbit. It uses Open4DGS-Core for matching and Open4DGS-Trigs for training and PLY export.
+Open4DGS provides the matching, training, and PLY export pipeline. This companion adds a managed 4DGS job interface around it, with matching-data preparation, durable optimizer checkpoints, stop and resume from saved state, run status, and validated PLY-sequence export.
 
 ## Install
 

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "xangle-4dgs-trainer"
 version = "0.1.0"
-description = "Standalone Open4DGS training companion"
+description = "Adds matching-data preparation, checkpointed stop/resume, run status, and validated PLY-sequence export to Open4DGS training."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "AGPL-3.0-only"
