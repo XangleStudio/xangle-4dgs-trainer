@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xangle-4dgs-trainer"
+version = "0.1.0"
+description = "Standalone Open4DGS training companion"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "AGPL-3.0-only"
+license-files = ["LICENSE"]
+
+[project.scripts]
+xangle-4dgs = "xangle_4dgs.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["xangle_4dgs*"]

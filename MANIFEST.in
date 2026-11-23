@@ -1,0 +1,2 @@
+include patches/trigs-checkpoint.patch
+include THIRD_PARTY_NOTICES.md

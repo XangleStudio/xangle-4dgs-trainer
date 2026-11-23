@@ -1,0 +1,937 @@
+diff --git a/src/trigs/cli/train_from_colmap.py b/src/trigs/cli/train_from_colmap.py
+index 0865b34..c62ec8f 100644
+--- a/src/trigs/cli/train_from_colmap.py
++++ b/src/trigs/cli/train_from_colmap.py
+@@ -27,10 +27,11 @@ from __future__ import annotations
+ 
+ import logging
+ import math
++import os
+ import subprocess
+ import sys
+ from collections import OrderedDict
+-from dataclasses import dataclass, field
++from dataclasses import dataclass, field, asdict
+ from pathlib import Path
+ from typing import Dict, List, Mapping, Optional, Sequence
+ 
+@@ -43,6 +44,7 @@ from trigs.core.trainer import (
+     training_camera_extent,
+ )
+ from trigs.core.viewer_snapshot import apply_default_snapshot_dir
++from trigs.core.xangle_checkpoint import DEFAULT_INTERVAL, TrainingCheckpoint, input_tree
+ from trigs.init.from_colmap import (
+     _knn_distance,
+     build_canonical_from_npz,
+@@ -1823,46 +1825,7 @@ def resolve_target_count(args: "TrigsColmapArgs", params: dict) -> None:
+              int(args.config.target_count_per_keyframe), n_keyframes, int(args.config.target_count))
+ 
+ 
+-def main(args: TrigsColmapArgs | None = None) -> None:
+-    if args is None:
+-        args = tyro.cli(TrigsColmapArgs)
+-    logging.basicConfig(
+-        level=logging.DEBUG if args.config.diagnostics else logging.INFO,
+-        format="%(levelname)s: %(message)s",
+-    )
+-    for noisy in ("matplotlib", "PIL", "urllib3", "h5py"):
+-        # Third-party DEBUG chatter stays off even when --config.diagnostics turns ours on.
+-        logging.getLogger(noisy).setLevel(logging.WARNING)
+-
+-    output_path = Path(args.output_dir)
+-    output_path.mkdir(parents=True, exist_ok=True)
+-    resolve_npz_defaults(args)
+-    write_run_args(args, output_path)
+-
+-    snap_dir = apply_default_snapshot_dir(args.config, output_path)
+-    if snap_dir is not None:
+-        log.info(
+-            "Viewer snapshots every %d steps -> %s (view: viewer.py --watch %s)",
+-            args.config.viewer_snapshot_every, snap_dir, snap_dir,
+-        )
+-    if args.end_frame < args.start_frame:
+-        raise ValueError(
+-            f"end_frame ({args.end_frame}) must be >= start_frame ({args.start_frame})"
+-        )
+-    if args.foregrounds_root is not None:
+-        missing_flags = []
+-        if args.masks_root is None:
+-            missing_flags.append("--masks-root")
+-        if not args.config.masked_rgb_loss:
+-            missing_flags.append("--config.masked-rgb-loss")
+-        if not args.config.masked_rgb_composite:
+-            missing_flags.append("--config.masked-rgb-composite")
+-        if missing_flags:
+-            raise ValueError(
+-                "--foregrounds-root contains straight foreground RGB and requires "
+-                + ", ".join(missing_flags)
+-            )
+-
++def _initialize_colmap_params(args: TrigsColmapArgs, output_path: Path):
+     hybrid_pair_mode = (args.hybrid_anchor_npz is not None) or (args.hybrid_coverage_npz is not None)
+     if hybrid_pair_mode and (args.hybrid_anchor_npz is None or args.hybrid_coverage_npz is None):
+         raise ValueError(
+@@ -2046,6 +2009,93 @@ def main(args: TrigsColmapArgs | None = None) -> None:
+         n_released = release_static_rows_to_dynamic(params)
+         log.info(f"--static-as-dynamic: {n_released:,} static rows now train as dynamic")
+ 
++    return params, sh_degree, scene_extent
++
++
++def _training_checkpoint(args, output_path, snap_dir):
++    source = os.environ.get("XANGLE_TRIGS_STATE_IN")
++    output = os.environ.get("XANGLE_TRIGS_STATE_OUT")
++    interval = os.environ.get("XANGLE_TRIGS_STATE_INTERVAL")
++    if not output:
++        if source or interval is not None:
++            raise ValueError("XANGLE_TRIGS_STATE_OUT is required for checkpoint mode")
++        return None
++    if args.npz_path is None or args.hybrid_anchor_npz or args.hybrid_coverage_npz:
++        raise ValueError("Checkpoint mode requires a prepared single --npz-path")
++    if Path(output).resolve().parent != output_path.resolve():
++        raise ValueError("Checkpoint output stem must be in --output-dir")
++    if args.data_dir.resolve() in (output_path.resolve(), *output_path.resolve().parents):
++        raise ValueError("Checkpoint output directory must be outside the input dataset")
++    if snap_dir is not None and (
++        not snap_dir.resolve().is_relative_to(output_path.resolve())
++        or snap_dir.resolve() == output_path.resolve()
++        or (snap_dir.exists() and any(snap_dir.iterdir()))
++    ):
++        raise ValueError("Checkpoint mode requires a fresh viewer directory under --output-dir")
++    inputs = asdict(args)
++    for key in ("config", "output_dir", "roma_input_dir"):
++        inputs.pop(key)
++    for key, value in inputs.items():
++        if isinstance(value, Path):
++            inputs[key] = input_tree(value)
++    observability = args.config.camera_time_offset_observability_json
++    if observability:
++        inputs["camera_time_offset_observability_json"] = input_tree(Path(observability))
++    device = torch.device(args.device)
++    if device.type == "cuda":
++        props = torch.cuda.get_device_properties(device)
++        inputs["cuda"] = [props.name, props.major, props.minor, torch.version.cuda]
++    return TrainingCheckpoint(output, source, args.config, inputs,
++                              interval=int(interval) if interval is not None else DEFAULT_INTERVAL)
++
++
++def main(args: TrigsColmapArgs | None = None) -> None:
++    if args is None:
++        args = tyro.cli(TrigsColmapArgs)
++    logging.basicConfig(
++        level=logging.DEBUG if args.config.diagnostics else logging.INFO,
++        format="%(levelname)s: %(message)s",
++    )
++    for noisy in ("matplotlib", "PIL", "urllib3", "h5py"):
++        logging.getLogger(noisy).setLevel(logging.WARNING)
++
++    output_path = Path(args.output_dir)
++    output_path.mkdir(parents=True, exist_ok=True)
++    resolve_npz_defaults(args)
++    snap_dir = apply_default_snapshot_dir(args.config, output_path)
++    if args.end_frame < args.start_frame:
++        raise ValueError(f"end_frame ({args.end_frame}) must be >= start_frame ({args.start_frame})")
++    if args.foregrounds_root is not None:
++        missing_flags = []
++        if args.masks_root is None:
++            missing_flags.append("--masks-root")
++        if not args.config.masked_rgb_loss:
++            missing_flags.append("--config.masked-rgb-loss")
++        if not args.config.masked_rgb_composite:
++            missing_flags.append("--config.masked-rgb-composite")
++        if missing_flags:
++            raise ValueError(
++                "--foregrounds-root contains straight foreground RGB and requires "
++                + ", ".join(missing_flags)
++            )
++    checkpoint = _training_checkpoint(args, output_path, snap_dir)
++    resumed = checkpoint is not None and checkpoint.state is not None
++    write_run_args(args, output_path)
++    if snap_dir is not None:
++        log.info(
++            "Viewer snapshots every %d steps -> %s (view: viewer.py --watch %s)",
++            checkpoint.interval if checkpoint is not None else args.config.viewer_snapshot_every,
++            snap_dir, snap_dir,
++        )
++    if resumed:
++        saved_scene = checkpoint.state["scene"]
++        params = checkpoint.parameters(torch.device(args.device))
++        sh_degree = saved_scene["sh_degree"]
++        scene_extent = saved_scene["scene_extent"]
++        args.config.target_count = saved_scene["target_count"]
++    else:
++        params, sh_degree, scene_extent = _initialize_colmap_params(args, output_path)
++
+     # -- Steps 3-4: cameras, GT images/masks, capture times -----------------
+     scene = build_colmap_scene(args)
+     parser, training_cam_ids = scene.parser, scene.training_cam_ids
+@@ -2062,7 +2112,7 @@ def main(args: TrigsColmapArgs | None = None) -> None:
+ 
+     observability_json = getattr(args.config, "camera_time_offset_observability_json", None)
+     camera_time_offset_scale = None
+-    if observability_json and getattr(args.config, "learn_camera_time_offsets", False):
++    if not resumed and observability_json and getattr(args.config, "learn_camera_time_offsets", False):
+         camera_time_offset_scale = _build_camera_time_offset_scale(
+             observability_file=Path(observability_json),
+             parser=parser,
+@@ -2091,6 +2141,9 @@ def main(args: TrigsColmapArgs | None = None) -> None:
+         raise SystemExit(
+             f"--config.scene-extent-mode must be 'official' or 'parser', got {extent_mode!r}"
+         )
++    if resumed and (saved_scene["n_frames"] != n_frames
++                    or saved_scene["scene_extent"] != train_scene_extent):
++        raise ValueError("Checkpoint scene geometry changed")
+ 
+     log.info(
+         "Scene extent for optimizer scaling: "
+@@ -2107,7 +2160,7 @@ def main(args: TrigsColmapArgs | None = None) -> None:
+     # covers every init path uniformly; static rows untouched.
+     _jit = float(getattr(args.config, "temporal_init_jitter_s", 0.0))
+     _dil = float(getattr(args.config, "temporal_init_sigma_dilate", 1.0))
+-    if _jit > 0.0 or _dil != 1.0:
++    if not resumed and (_jit > 0.0 or _dil != 1.0):
+         with torch.no_grad():
+             dyn = torch.ones(
+                 params["times"].shape[0],
+@@ -2161,6 +2214,7 @@ def main(args: TrigsColmapArgs | None = None) -> None:
+                 config=args.config,
+                 gt_times_per_frame=gt_times,
+                 writer=tb_writer,
++                training_checkpoint=checkpoint,
+             )
+     finally:
+         if tb_writer is not None:
+diff --git a/src/trigs/core/trainer.py b/src/trigs/core/trainer.py
+index 5835f14..91a186f 100644
+--- a/src/trigs/core/trainer.py
++++ b/src/trigs/core/trainer.py
+@@ -32,7 +32,7 @@ from __future__ import annotations
+ import math
+ import random
+ import dataclasses
+-from dataclasses import dataclass, field
++from dataclasses import dataclass, field, replace
+ from pathlib import Path
+ from typing import Any, Dict, List, Mapping, Optional, Sequence, TYPE_CHECKING
+ 
+@@ -57,6 +57,7 @@ from .optimizer_state import (
+     remap_param_with_sliced_state,
+ )
+ from .viewer_snapshot import should_snapshot, write_viewer_snapshot
++from .xangle_checkpoint import TrainingCheckpoint, restore_optimizers, restore_rng
+ from ..math.quaternion import quaternion_multiply, quaternion_to_rotmat
+ from ..math.se3 import bezier_quadratic, bezier_rewindow, exp_se3_quat, gauge_fix_omega, tau_from_window
+ from ..math.twist_init import fit_local_twist, local_knn_indices
+@@ -1784,6 +1785,7 @@ class TrigsTrainer:
+         return_optimizer_state: bool = False,
+         frame_weights: Optional[Sequence[float]] = None,
+         progress_bar: Optional[Any] = None,
++        training_checkpoint: Optional[TrainingCheckpoint] = None,
+     ) -> TrigsTrainingResult:
+         """``frame_weights`` (aligned with ``frame_indices``) sets the frame choice of every
+         step directly; chunked training uses it to carry the fast-frame top-up into chunk calls."""
+@@ -1806,7 +1808,13 @@ class TrigsTrainer:
+                 params["cam_gain"] = nn.Parameter(torch.ones(len(cameras), 3, device=self.device))
+             if "cam_bias" not in params:
+                 params["cam_bias"] = nn.Parameter(torch.zeros(len(cameras), 3, device=self.device))
+-        if getattr(config, "record_relocation_lineage", False):
++        resume_state = training_checkpoint.state if training_checkpoint is not None else None
++        if training_checkpoint is not None and (
++            initial_optimizer_state or initial_optimizer_step or frame_indices is not None
++            or frame_weights is not None or progress_bar is not None
++        ):
++            raise ValueError("Checkpoint mode requires a full unchunked scene")
++        if resume_state is None and getattr(config, "record_relocation_lineage", False):
+             self._add_relocation_lineage(params, donor_count=True)
+         if config.verbose:
+             print(
+@@ -1819,20 +1827,27 @@ class TrigsTrainer:
+             load_param_state(
+                 optimizers, params, initial_optimizer_state, initial_optimizer_step,
+             )
+-        self._pin_static_background_rows(params, config, n_frames)
+-        rigid_time_weight = self._rigid_time_weight_value(config, scene_extent, n_frames)
+-        nn_indices = self._compute_knn(
+-            self._rigid_knn_points(params, config).detach(),
+-            config.knn_k,
+-            times=params["times"].detach(),
+-            time_weight=rigid_time_weight,
+-        )
++        if resume_state is not None:
++            restore_optimizers(optimizers, resume_state.pop("optimizers"))
++            nn_indices = resume_state["loop"]["base_nn_indices"]
++            if nn_indices is not None:
++                nn_indices = nn_indices.to(self.device)
++        else:
++            self._pin_static_background_rows(params, config, n_frames)
++            rigid_time_weight = self._rigid_time_weight_value(config, scene_extent, n_frames)
++            nn_indices = self._compute_knn(
++                self._rigid_knn_points(params, config).detach(),
++                config.knn_k,
++                times=params["times"].detach(),
++                time_weight=rigid_time_weight,
++            )
+ 
+         if config.sigma_floor_target > 0:
+             sigma_floor_target = config.sigma_floor_target
+         else:
+             sigma_floor_target = max(config.keyframe_stride, 1) / max(config.fps, 1e-6)
+ 
++        del resume_state
+         metrics = self._train_loop(
+             params, optimizers, nn_indices,
+             cameras, n_frames, sh_degree,
+@@ -1845,6 +1860,7 @@ class TrigsTrainer:
+             frame_indices=frame_indices,
+             frame_weights_override=frame_weights,
+             progress_bar=progress_bar,
++            training_checkpoint=training_checkpoint,
+         )
+         result = self._package_result(params, metrics)
+         if return_optimizer_state:
+@@ -4938,6 +4954,7 @@ class TrigsTrainer:
+         frame_indices: Optional[List[int]] = None,
+         frame_weights_override: Optional[Sequence[float]] = None,
+         progress_bar: Optional[Any] = None,
++        training_checkpoint: Optional[TrainingCheckpoint] = None,
+     ) -> Dict[str, Any]:
+         from ..strategy.motion_guided_relocation import (
+             MotionGuidedRelocationConfig,
+@@ -4946,6 +4963,13 @@ class TrigsTrainer:
+ 
+         gt_images_per_frame = gt_images
+         gt_alphas_per_frame = gt_alphas
++        resume = training_checkpoint.state if training_checkpoint is not None else None
++        saved = resume["loop"] if resume is not None else None
++        first_step = training_checkpoint.completed if training_checkpoint is not None else 0
++        schedule_config = (replace(config, n_steps=training_checkpoint.horizon)
++                           if training_checkpoint is not None else config)
++        base_nn_indices = nn_indices
++        scene_degree = sh_degree
+ 
+         train_seed = int(getattr(config, "train_seed", -1))
+         if train_seed >= 0:
+@@ -5074,17 +5098,21 @@ class TrigsTrainer:
+         if fast_frame_mask is not None and bool(fast_frame_mask.any()) and bool((~fast_frame_mask).any()):
+             capacity_start = alive_rows_per_frame(params, n_frames, config.fps, config.relocate_tau_alpha).double()
+ 
+-        epoch_iter = iter([])
++        epoch_pending = saved["epoch_pending"] if saved is not None else []
+         metrics: Dict[str, Any] = {
+             "n_initial": params["means"].shape[0],
+             "snapshots": [], "prune_events": [],
+         }
++        if saved is not None:
++            metrics = saved["metrics"]
+         if progress_bar is not None:
+             # Chunked training: one bar for the whole run, owned by train_chunked.
+             iterator = _ticking_range(config.n_steps, progress_bar)
+             bar = progress_bar
+         else:
+-            iterator = trange(config.n_steps, desc="TRiGS") if config.verbose else range(config.n_steps)
++            iterator = (trange(first_step, config.n_steps, desc="TRiGS",
++                               initial=first_step, total=config.n_steps)
++                        if config.verbose else range(first_step, config.n_steps))
+             bar = iterator
+ 
+         viewer_dir = self._viewer_snapshot_dir(config)
+@@ -5112,12 +5140,15 @@ class TrigsTrainer:
+             for name, opt in optimizers.items()
+             if name in decay_ratios
+         }
++        if saved is not None:
++            initial_lrs = saved["initial_lrs"]
+ 
+         temporal_names = ["opacities", "times", "log_durations"]
+         if "camera_time_offsets" in params:
+             temporal_names.append("camera_time_offsets")
+-        temporal_frozen = config.unfreeze_temporal_step > 0
+-        if temporal_frozen:
++        temporal_frozen = (saved["temporal_frozen"] if saved is not None
++                           else config.unfreeze_temporal_step > 0)
++        if temporal_frozen and saved is None:
+             for name in temporal_names:
+                 params[name].requires_grad_(False)
+             if config.verbose:
+@@ -5162,7 +5193,9 @@ class TrigsTrainer:
+         )
+         reloc_state = relocation_strategy.initialize_state(
+             n_primitives=params["means"].shape[0], device=params["means"].device,
+-        )
++        ) if saved is None else {
++            key: value.to(self.device) for key, value in saved["reloc_state"].items()
++        }
+ 
+         def deform_rows(rows: Dict[str, Tensor], t: Tensor) -> tuple[Tensor, Tensor]:
+             means_t, quats_t, _ = self._deform(rows, t, config)
+@@ -5187,7 +5220,14 @@ class TrigsTrainer:
+                 return nn_dyn, dyn_rows
+             return nn_indices, dyn_rows
+ 
+-        nn_indices, rigid_loss_rows = _refresh_rigid_knn_for_current_rows()
++        if saved is None:
++            nn_indices, rigid_loss_rows = _refresh_rigid_knn_for_current_rows()
++        else:
++            nn_indices = saved["nn_indices"]
++            if nn_indices is not None:
++                nn_indices = nn_indices.to(self.device)
++            rigid_loss_rows = saved["rigid_loss_rows"].to(self.device)
++            rigid_knn_dirty = saved["rigid_knn_dirty"]
+ 
+         if config.diagnostics and nn_indices is not None:
+             with torch.no_grad():
+@@ -5248,6 +5288,40 @@ class TrigsTrainer:
+ 
+         opdiag_every = int(getattr(config, "opacity_diag_every", 0))
+         opdiag: Optional[Dict[str, Tensor]] = None
++        if saved is not None and saved["opdiag"] is not None:
++            opdiag = {key: value.to(self.device) for key, value in saved["opdiag"].items()}
++
++        def commit(completed, active_degree):
++            snapshot = None
++            if viewer_dir is not None:
++                snapshot, _, _ = write_viewer_snapshot(
++                    viewer_dir, params=params, step=completed, n_steps=config.n_steps,
++                    fps=config.fps, n_frames=n_frames, sh_degree=max_sh_degree_runtime,
++                    sh_degree_active=active_degree, config=config, durable=True,
++                    extra={"mode": "unchunked", "n_rows": int(params["means"].shape[0])},
++                    keep_last=max(2, config.viewer_snapshot_keep_last),
++                    keep_every=config.viewer_snapshot_keep_every, dtype=config.viewer_snapshot_dtype,
++                )
++            training_checkpoint.write(
++                completed, {"sh_degree": int(scene_degree), "scene_extent": float(scene_extent),
++                            "n_frames": int(n_frames), "target_count": config.target_count},
++                params, optimizers,
++                {"base_nn_indices": base_nn_indices, "nn_indices": nn_indices,
++                 "rigid_loss_rows": rigid_loss_rows, "rigid_knn_dirty": rigid_knn_dirty,
++                 "reloc_state": reloc_state, "initial_lrs": initial_lrs,
++                 "temporal_frozen": temporal_frozen, "epoch_pending": epoch_pending,
++                 "opdiag": opdiag, "metrics": metrics}, self.device, snapshot,
++            )
++
++        if resume is not None:
++            restore_rng(resume["rng"], self.device)
++            training_checkpoint.state = None
++            del resume, saved
++            print(f"[XANGLE_TRIGS_RESUME] completedSteps={first_step} "
++                  f"scheduleSteps={training_checkpoint.horizon}", flush=True)
++            if first_step == config.n_steps:
++                commit(first_step, _sh_degree_for_step(config, first_step - 1, max_sh_degree_runtime))
++
+         for step in iterator:
+             sh_degree = _sh_degree_for_step(config, step, max_sh_degree_runtime)
+ 
+@@ -5264,7 +5338,7 @@ class TrigsTrainer:
+                 if config.verbose:
+                     print(f"  Step {step}: unfreezing temporal params")
+ 
+-            progress = _lr_schedule_progress(config, step)
++            progress = _lr_schedule_progress(schedule_config, step)
+             for name, ratio in decay_ratios.items():
+                 if name not in optimizers:
+                     continue
+@@ -5284,15 +5358,13 @@ class TrigsTrainer:
+                     weighted_frac=fast_frac,
+                 )
+             else:
+-                try:
+-                    frame_idx, cam_group = next(epoch_iter)
+-                except StopIteration:
+-                    epoch_iter = iter(_build_camera_batch_epoch(
++                if not epoch_pending:
++                    epoch_pending = list(reversed(_build_camera_batch_epoch(
+                         frame_indices if frame_indices is not None else range(n_frames),
+                         train_views,
+                         batch_cameras,
+-                    ))
+-                    frame_idx, cam_group = next(epoch_iter)
++                    )))
++                frame_idx, cam_group = epoch_pending.pop()
+ 
+             offset_active = (
+                 "camera_time_offsets" in params
+@@ -5735,8 +5807,8 @@ class TrigsTrainer:
+ 
+             n_reloc = 0
+             settle = int(getattr(config, "relocate_settle_steps", 0))
+-            in_settle_window = settle > 0 and step >= int(config.n_steps) - settle
+-            past_reloc_stop = _relocation_past_stop(config, step)
++            in_settle_window = settle > 0 and step >= int(schedule_config.n_steps) - settle
++            past_reloc_stop = _relocation_past_stop(schedule_config, step)
+             if not delayed_pruning_active and not in_settle_window:
+                 self._cuda_probe(f"step={step} before relocation")
+ 
+@@ -5870,7 +5942,7 @@ class TrigsTrainer:
+ 
+             # End of the step body: this step's update, clamps, relocation and
+             # static re-pin have all run, so step + 1 updates are in `params`.
+-            if viewer_dir is not None and should_snapshot(
++            if training_checkpoint is None and viewer_dir is not None and should_snapshot(
+                 step + 1, config.viewer_snapshot_every, last_viewer_step,
+                 final=(step + 1 == int(config.n_steps)),
+             ):
+@@ -6049,6 +6121,9 @@ class TrigsTrainer:
+                     self._log_fixed_active_stats(writer, step, params, config, t_max=t_max)
+                 
+ 
++            if training_checkpoint is not None and training_checkpoint.due(step + 1, config.n_steps):
++                commit(step + 1, sh_degree)
++
+         metrics["final_count"] = params["means"].shape[0]
+         if config.verbose and metrics.get("capacity"):
+             print(_capacity_summary(metrics["capacity"][-1]))
+diff --git a/src/trigs/core/viewer_snapshot.py b/src/trigs/core/viewer_snapshot.py
+index 45d455b..3687699 100644
+--- a/src/trigs/core/viewer_snapshot.py
++++ b/src/trigs/core/viewer_snapshot.py
+@@ -133,6 +133,7 @@ def write_viewer_snapshot(
+     keep_last: int = 3,
+     keep_every: int = 0,
+     dtype: str = "float32",
++    durable: bool = False,
+ ) -> Tuple[Path, int, float]:
+     """Write a params-only snapshot and move ``latest.json`` onto it.
+ 
+@@ -182,7 +183,13 @@ def write_viewer_snapshot(
+ 
+     path = out_dir / f"snap_s{int(step):07d}.pt"
+     tmp = path.with_suffix(path.suffix + ".tmp")
+-    torch.save(payload, tmp)
++    if durable:
++        with tmp.open("wb") as file:
++            torch.save(payload, file)
++            file.flush()
++            os.fsync(file.fileno())
++    else:
++        torch.save(payload, tmp)
+     nbytes = tmp.stat().st_size
+     os.replace(tmp, path)
+ 
+diff --git a/src/trigs/core/xangle_checkpoint.py b/src/trigs/core/xangle_checkpoint.py
+new file mode 100644
+index 0000000..2896fac
+--- /dev/null
++++ b/src/trigs/core/xangle_checkpoint.py
+@@ -0,0 +1,242 @@
++"""Local Xangle trainer continuation; separate from viewer snapshots."""
++
++import json
++import hashlib
++import os
++import random
++import sys
++import uuid
++from dataclasses import asdict
++from pathlib import Path
++from zipfile import ZipFile
++
++import numpy as np
++import torch
++
++
++CAPABILITY = {"format": "xangle_trigs_training", "version": 1}
++DEFAULT_INTERVAL = 1000
++LR_POLICY = "preserve-original-schedule"
++
++
++def marker_path(stem):
++    return stem.with_name(stem.name + ".json")
++
++
++def atomic_json(path, value):
++    pending = path.with_name(f".{path.name}.{uuid.uuid4().hex}.pending")
++    try:
++        with pending.open("xb") as file:
++            file.write(json.dumps(value, allow_nan=False).encode("ascii"))
++            file.flush()
++            os.fsync(file.fileno())
++        os.replace(pending, path)
++    finally:
++        pending.unlink(missing_ok=True)
++
++
++def committed_file(marker, name):
++    relative = Path(name)
++    if relative.is_absolute() or relative.drive or ".." in relative.parts:
++        raise ValueError(f"Invalid checkpoint-relative path: {name!r}")
++    path = (marker.parent / relative).resolve(strict=True)
++    if not path.is_relative_to(marker.parent.resolve()) or not path.is_file() or not path.stat().st_size:
++        raise ValueError(f"Invalid committed checkpoint file: {path}")
++    return path
++
++
++def checkpoint_info(path):
++    # The ZIP comment and tensors are published by the same rename. Reading
++    # progress does not import/unpickle model objects or scan tensor records.
++    with ZipFile(path) as archive:
++        info = json.loads(archive.comment)
++    if (not isinstance(info, dict)
++            or any(info.get(key) != value for key, value in CAPABILITY.items())
++            or type(info.get("version")) is not int
++            or type(info.get("completedSteps")) is not int
++            or info["completedSteps"] < 1
++            or type(info.get("scheduleSteps")) is not int
++            or info["scheduleSteps"] < 1
++            or info.get("lrPolicy") != LR_POLICY):
++        raise ValueError("Not a compatible Xangle TRiGS training checkpoint")
++    return info
++
++
++def runtime_fingerprint():
++    root = Path(__file__).resolve().parents[1]
++    digest = hashlib.sha256()
++    for path in sorted(root.rglob("*.py")):
++        digest.update(path.relative_to(root).as_posix().encode("utf-8") + b"\0")
++        digest.update(hashlib.sha256(path.read_bytes()).digest())
++    return digest.hexdigest()
++
++
++def rng_state(device):
++    algorithm, keys, pos, gaussian, cached = np.random.get_state()
++    return {
++        "python": random.getstate(),
++        "numpy": (algorithm, keys.tolist(), pos, gaussian, cached),
++        "torch": torch.get_rng_state(),
++        "cuda": torch.cuda.get_rng_state(device) if device.type == "cuda" else None,
++    }
++
++
++def restore_rng(state, device):
++    random.setstate(state["python"])
++    algorithm, keys, pos, gaussian, cached = state["numpy"]
++    np.random.set_state((algorithm, np.array(keys, dtype=np.uint32), pos, gaussian, cached))
++    torch.set_rng_state(state["torch"])
++    if device.type == "cuda":
++        torch.cuda.set_rng_state(state["cuda"], device)
++
++
++def restore_optimizers(optimizers, states):
++    if optimizers.keys() != states.keys():
++        raise ValueError("Checkpoint optimizer names do not match the trainer")
++    for name, optimizer in optimizers.items():
++        saved = states[name]
++        groups = saved["param_groups"]
++        if len(groups) != len(optimizer.param_groups):
++            raise ValueError(f"Checkpoint optimizer groups do not match: {name}")
++        ids = set()
++        for group, actual in zip(groups, optimizer.param_groups):
++            if len(group["params"]) != len(actual["params"]):
++                raise ValueError(f"Checkpoint optimizer parameters do not match: {name}")
++            for key, param in zip(group["params"], actual["params"]):
++                if key in ids:
++                    raise ValueError(f"Duplicate checkpoint optimizer parameter: {name}")
++                ids.add(key)
++                state = saved["state"].get(key, {})
++                if state:
++                    expected = {"step", "exp_avg", "exp_avg_sq"}
++                    if group.get("amsgrad"):
++                        expected.add("max_exp_avg_sq")
++                    if state.keys() != expected or state["step"].numel() != 1:
++                        raise ValueError(f"Invalid checkpoint Adam state: {name}")
++                    if any(state[m].shape != param.shape for m in expected - {"step"}):
++                        raise ValueError(f"Checkpoint Adam moment shape mismatch: {name}")
++        if not saved["state"].keys() <= ids:
++            raise ValueError(f"Unexpected checkpoint optimizer state: {name}")
++        optimizer.load_state_dict(saved)
++
++
++class TrainingCheckpoint:
++    def __init__(self, output, source, config, inputs, *, interval=DEFAULT_INTERVAL):
++        self.output = Path(output).resolve()
++        self.marker = marker_path(self.output)
++        self.interval = interval
++        self.horizon = config.n_steps
++        self.generations = []
++        if config.n_steps < 1 or interval < 0:
++            raise ValueError("Checkpoint mode requires positive n-steps and interval >= 0")
++        if self.output.exists() or self.marker.exists():
++            raise ValueError("Checkpoint output must be a new per-attempt stem")
++        if (config.temporal_chunk_len_s > 0 or config.temporal_hierarchy_enabled
++                or config.frame_sampling_fast_visits != 0 or config.frame_sampling_fast_frac != 0
++                or config.lr_schedule_total_steps != 0 or config.lr_schedule_offset_steps != 0
++                or config.lr_schedule_step_scale != 1):
++            raise ValueError("Checkpoint mode requires unchunked training without temporal hierarchy, "
++                             "fast-frame weighting or a chunk LR schedule")
++
++        settings = asdict(config)
++        for key in ("n_steps", "viewer_snapshot_dir", "viewer_snapshot_every",
++                    "viewer_snapshot_keep_last", "viewer_snapshot_keep_every",
++                    "viewer_snapshot_dtype"):
++            settings.pop(key, None)
++        self.contract = json.loads(json.dumps({
++            "config": settings,
++            "inputs": inputs,
++            "python": list(sys.version_info[:3]),
++            "torch": str(torch.__version__),
++            "numpy": np.__version__,
++            "runtime": runtime_fingerprint(),
++        }, default=str, sort_keys=True))
++        self.completed = 0
++        self.state = None
++        if source:
++            marker = marker_path(Path(source).resolve())
++            commit = json.loads(marker.read_text(encoding="utf-8"))
++            if (not isinstance(commit, dict) or type(commit.get("version")) is not int
++                    or any(commit.get(key) != value for key, value in CAPABILITY.items())
++                    or type(commit.get("completedSteps")) is not int
++                    or type(commit.get("scheduleSteps")) is not int):
++                raise ValueError("Invalid Xangle TRiGS checkpoint commit marker")
++            checkpoint = committed_file(marker, commit["checkpointFile"])
++            info = checkpoint_info(checkpoint)
++            if any(commit.get(key) != value for key, value in info.items()):
++                raise ValueError("Checkpoint header does not match commit marker")
++            if commit["snapshotFile"] is not None:
++                committed_file(marker, commit["snapshotFile"])
++            state = torch.load(checkpoint, map_location="cpu", weights_only=True)
++            if state["info"] != info:
++                raise ValueError("Checkpoint progress metadata does not match training state")
++            if state["contract"] != self.contract:
++                previous = state["contract"]
++                changed = [key for key in self.contract if self.contract[key] != previous.get(key)]
++                if "config" in changed:
++                    changed.extend(f"config.{key}" for key, value in self.contract["config"].items()
++                                   if value != previous.get("config", {}).get(key))
++                raise ValueError("Incompatible Xangle TRiGS checkpoint: " + ", ".join(changed))
++            self.completed = info["completedSteps"]
++            self.horizon = info["scheduleSteps"]
++            if self.completed > config.n_steps:
++                raise ValueError(f"Target {config.n_steps} precedes checkpoint step {self.completed}")
++            self.state = state
++
++    def parameters(self, device):
++        return torch.nn.ParameterDict({
++            name: torch.nn.Parameter(tensor.to(device), requires_grad=self.state["grad"][name])
++            for name, tensor in self.state.pop("params").items()
++        })
++
++    def due(self, completed, target):
++        return completed == target or (self.interval > 0 and completed % self.interval == 0)
++
++    def write(self, completed, scene, params, optimizers, loop, device, snapshot=None):
++        info = {**CAPABILITY, "completedSteps": completed, "scheduleSteps": self.horizon,
++                "lrPolicy": LR_POLICY}
++        checkpoint = self.output.with_name(f"{self.output.name}.s{completed:07d}.{uuid.uuid4().hex}.pt")
++        snapshot_relative = (str(snapshot.resolve().relative_to(self.marker.parent)).replace(os.sep, "/")
++                             if snapshot is not None else None)
++        payload = {
++            "info": info, "contract": self.contract, "scene": scene,
++            "params": {key: value.detach() for key, value in params.items()},
++            "grad": {key: value.requires_grad for key, value in params.items()},
++            "optimizers": {key: value.state_dict() for key, value in optimizers.items()},
++            "loop": loop, "rng": rng_state(device),
++        }
++        self.output.parent.mkdir(parents=True, exist_ok=True)
++        pending = self.output.with_name(f".{self.output.name}.{uuid.uuid4().hex}.pending")
++        try:
++            with pending.open("x+b") as file:
++                torch.save(payload, file)
++                with ZipFile(file, "a") as archive:
++                    archive.comment = json.dumps(info).encode("ascii")
++                file.flush()
++                os.fsync(file.fileno())
++            os.replace(pending, checkpoint)
++            atomic_json(self.marker, {**info, "checkpointFile": checkpoint.name,
++                                      "snapshotFile": snapshot_relative})
++        finally:
++            pending.unlink(missing_ok=True)
++        self.generations.append(checkpoint)
++        if len(self.generations) > 2:
++            old = self.generations.pop(0)
++            try:
++                old.unlink(missing_ok=True)
++            except OSError:
++                pass
++        print(f"[XANGLE_TRIGS_CHECKPOINT] completedSteps={completed}", flush=True)
++
++
++def input_identity(path):
++    path = Path(path).resolve(strict=True)
++    stat = path.stat()
++    return str(path), stat.st_size, stat.st_mtime_ns
++
++
++def input_tree(path):
++    root = Path(path).resolve(strict=True)
++    if not root.is_dir():
++        return input_identity(root)
++    return [str(root), [input_identity(p) for p in sorted(root.rglob("*")) if p.is_file()]]
+diff --git a/tests/test_xangle_checkpoint.py b/tests/test_xangle_checkpoint.py
+new file mode 100644
+index 0000000..d5686c3
+--- /dev/null
++++ b/tests/test_xangle_checkpoint.py
+@@ -0,0 +1,166 @@
++import json
++import random
++from types import SimpleNamespace
++
++import numpy as np
++import pytest
++import torch
++
++from trigs.core import xangle_checkpoint as checkpoint_module
++from trigs.core.trainer import TrigsTrainer, TrigsTrainingConfig
++from trigs.core.xangle_checkpoint import TrainingCheckpoint, marker_path
++from trigs.cli import train_from_colmap as cli
++from tests.test_trainer import _fake_render, _make_params
++
++
++class Interrupted(Exception):
++    pass
++
++
++@pytest.mark.parametrize("sampling", ["official", "epoch"])
++def test_cpu_trainer_checkpoint_resume(tmp_path, monkeypatch, sampling):
++    draws = []
++
++    def render(self, params, cameras, cam_idx, t, sh_degree, config, step=None):
++        draws.append((step, cam_idx, t, random.random(), np.random.random(), torch.rand(()).item()))
++        return _fake_render(self, params, cameras, cam_idx, t, sh_degree, config, step)
++
++    monkeypatch.setattr(TrigsTrainer, "_render", render)
++    monkeypatch.setattr("trigs.core.trainer.reconstruction_loss",
++                        lambda pred, target, **_: (pred - target).abs().mean())
++    n_frames, n_cams = 4, 3
++    gt = {f: [torch.full((4, 4, 3), 20 * (f + c), dtype=torch.uint8)
++              for c in range(n_cams)] for f in range(n_frames)}
++    masks = {f: [torch.full((4, 4), 255, dtype=torch.uint8)
++                 for _ in range(n_cams)] for f in range(n_frames)}
++
++    def run(name, target, *, source=None, interval=0, stop=None):
++        stem = tmp_path / name / "state.pt"
++        torch.manual_seed(7)
++        random.seed(8)
++        np.random.seed(9)
++        config = TrigsTrainingConfig(
++            n_steps=target, verbose=False, fps=2.0, batch_cameras=2,
++            ssim_lambda=0,
++            camera_sampling=sampling, frame_sampling_fast_visits=0,
++            viewer_snapshot_dir=str(stem.parent / "viewer_snapshots"),
++            knn_recompute_every=2, unfreeze_temporal_step=3,
++            relocate_start_iter=1, relocate_every=2, relocate_tau_alpha=0.01,
++        )
++        ck = TrainingCheckpoint(stem, source, config, {"dataset": "example"}, interval=interval)
++        if stop:
++            write = ck.write
++
++            def stop_after_commit(step, *args, **kwargs):
++                write(step, *args, **kwargs)
++                if step == stop:
++                    raise Interrupted
++
++            ck.write = stop_after_commit
++        params = ck.parameters(torch.device("cpu")) if ck.state else _make_params(N=24)
++        result = TrigsTrainer(device="cpu").train_from_params(
++            params, 0, 1.0, [None] * n_cams, n_frames, gt, masks, config,
++            training_checkpoint=ck,
++        )
++        commit = json.loads(marker_path(stem).read_text())
++        payload = torch.load(stem.parent / commit["checkpointFile"], weights_only=True)
++        snapshot = torch.load(stem.parent / commit["snapshotFile"], weights_only=True)
++        assert snapshot["step"] == commit["completedSteps"] == target
++        assert snapshot["progress"] == 1
++        return stem, result, payload
++
++    _, uninterrupted, whole = run("whole", 8)
++    expected_draws = draws[:]
++    draws.clear()
++    with pytest.raises(Interrupted):
++        run("interrupted", 8, interval=2, stop=4)
++    old = tmp_path / "interrupted" / "state.pt"
++    assert json.loads(marker_path(old).read_text())["completedSteps"] == 4
++    final_stem, continued, final = run("continued", 8, source=old)
++    assert draws == expected_draws
++    for name in uninterrupted.params:
++        torch.testing.assert_close(uninterrupted.params[name], continued.params[name], rtol=0, atol=0)
++    torch.testing.assert_close(whole["optimizers"], final["optimizers"], rtol=0, atol=0)
++    torch.testing.assert_close(whole["loop"]["reloc_state"], final["loop"]["reloc_state"], rtol=0, atol=0)
++    _, _, extended = run("extended", 10, source=final_stem)
++    assert extended["info"]["scheduleSteps"] == 8
++    for name, state in extended["optimizers"].items():
++        assert state["param_groups"][0]["lr"] == final["optimizers"][name]["param_groups"][0]["lr"]
++    _, _, reexport = run("reexport", 8, source=final_stem)
++    torch.testing.assert_close(reexport["params"], final["params"], rtol=0, atol=0)
++
++
++def test_uncommitted_generation_never_replaces_prior_marker(tmp_path, monkeypatch):
++    config = TrigsTrainingConfig(n_steps=8, frame_sampling_fast_visits=0)
++    stem = tmp_path / "state.pt"
++    ck = TrainingCheckpoint(stem, None, config, {})
++    payload = ({"n_frames": 4}, _make_params(4), {}, {}, torch.device("cpu"))
++    ck.write(2, *payload)
++    prior = marker_path(stem).read_bytes()
++
++    def fail_commit(*args, **kwargs):
++        raise OSError("simulated failure before marker rename")
++
++    monkeypatch.setattr(checkpoint_module, "atomic_json", fail_commit)
++    with pytest.raises(OSError, match="simulated failure"):
++        ck.write(4, *payload)
++    assert marker_path(stem).read_bytes() == prior
++    assert TrainingCheckpoint(tmp_path / "next.pt", stem, config, {}).completed == 2
++    with pytest.raises(ValueError, match="Incompatible.*inputs"):
++        TrainingCheckpoint(tmp_path / "incompatible.pt", stem, config, {"different": True})
++    marker_path(stem).unlink()
++    with pytest.raises(FileNotFoundError):
++        TrainingCheckpoint(tmp_path / "missing.pt", stem, config, {})
++
++
++def test_colmap_cli_uses_marker_and_skips_canonical_initialization(tmp_path, monkeypatch):
++    data = tmp_path / "data"
++    data.mkdir()
++    image = data / "image.jpg"
++    image.write_bytes(b"fixed input")
++    npz = tmp_path / "keyframes.npz"
++    np.savez(npz, source_frame_start=0, source_frame_end=1, keyframe_step=1)
++    zeros = torch.zeros((4, 4, 3), dtype=torch.uint8)
++    scene = SimpleNamespace(
++        parser=SimpleNamespace(scene_scale=1.0), training_cam_ids=[0],
++        cameras=type("Cameras", (list,), {"viewmats": None})([None]), n_frames=2,
++        gt_images={0: [zeros], 1: [zeros]}, gt_alphas=None, gt_times=None,
++    )
++    initialized = []
++
++    def initialize(*_):
++        initialized.append(True)
++        return _make_params(24), 0, 1.0
++
++    monkeypatch.setattr(cli, "_initialize_colmap_params", initialize)
++    monkeypatch.setattr(cli, "build_colmap_scene", lambda _: scene)
++    monkeypatch.setattr(cli, "training_camera_extent", lambda *_, **__: 1.0)
++    monkeypatch.setattr(TrigsTrainer, "_render", _fake_render)
++    monkeypatch.setattr("trigs.core.trainer.reconstruction_loss",
++                        lambda pred, target, **_: (pred - target).abs().mean())
++
++    def run(name, target, source=None):
++        out = tmp_path / name
++        stem = out / "state.pt"
++        monkeypatch.setenv("XANGLE_TRIGS_STATE_OUT", str(stem))
++        monkeypatch.setenv("XANGLE_TRIGS_STATE_IN", str(source) if source else "")
++        args = cli.TrigsColmapArgs(
++            data_dir=data, npz_path=npz, output_dir=out, device="cpu",
++            config=TrigsTrainingConfig(n_steps=target, verbose=False, relocate=False,
++                                       frame_sampling_fast_visits=0, tb_log_every=0,
++                                       tb_stats_every=0),
++        )
++        cli.main(args)
++        assert (out / "trigs_ckpt.pt").is_file()
++        return stem
++
++    first = run("first", 2)
++    second = run("second", 3, first)
++    assert initialized == [True]
++    assert json.loads(marker_path(second).read_text())["completedSteps"] == 3
++    with pytest.raises(ValueError, match="precedes checkpoint"):
++        run("lower", 1, second)
++    image.write_bytes(b"changed input size")
++    with pytest.raises(ValueError, match="Incompatible.*inputs"):
++        run("changed", 4, second)
++    assert not marker_path(tmp_path / "changed" / "state.pt").exists()
+diff --git a/xangle_checkpoint_capability.json b/xangle_checkpoint_capability.json
+new file mode 100644
+index 0000000..482398c
+--- /dev/null
++++ b/xangle_checkpoint_capability.json
+@@ -0,0 +1 @@
++{"format": "xangle_trigs_training", "version": 1}
+\ No newline at end of file
